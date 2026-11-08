@@ -1,6 +1,6 @@
 # GPT-2 (124M) From Scratch in PyTorch
 
-A from-scratch implementation of the GPT-2 small architecture (124M parameters), built layer by layer starting from a dummy placeholder model. The model is **untrained**: it uses random weights, so generated text is gibberish. Training is the next step.
+A from-scratch implementation of the GPT-2 small architecture (124M parameters), built layer by layer. The model is **untrained**: it uses random weights, so generated text is gibberish. Training is the next step.
 
 ## What's inside
 
@@ -8,11 +8,9 @@ All code is in [`gpt2_model.py`](gpt2_model.py):
 
 | Component | Description |
 |---|---|
-| `DummyGPTModel` | Skeleton with placeholder transformer block and layer norm |
 | `LayerNorm` | Layer normalization with learnable scale and shift |
 | `GELU` | Tanh approximation of GELU used by GPT-2 |
 | `FeedForward` | Linear (768 → 3072), GELU, Linear (3072 → 768) |
-| `ExampleDeepNeuralNetwork` | Demo showing how shortcut connections fix vanishing gradients |
 | `MultiHeadAttention` | Causal multi-head self-attention, all heads in one batched pass |
 | `TransformerBlock` | Pre-LayerNorm attention and feed-forward, each with a residual connection |
 | `GPTModel` | Full model: embeddings, 12 transformer blocks, final norm, output head |
