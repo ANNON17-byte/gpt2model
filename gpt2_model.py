@@ -1,6 +1,12 @@
+import os
+import json
+import requests
+import numpy as np
+import tensorflow as tf
 import torch
 import torch.nn as nn
 import tiktoken
+from tqdm import tqdm
 
 
 GPT_CONFIG_124M = {
@@ -40,9 +46,6 @@ class LayerNorm(nn.Module):
 
 class GELU(nn.Module):
 
-    def __init__(self):
-        super().__init__()
-
     def forward(self, x):
 
         return 0.5 * x * (1 + torch.tanh(
@@ -64,52 +67,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
-
-
-class ExampleDeepNeuralNetwork(nn.Module):
-
-    def __init__(self, layer_sizes, use_shortcut):
-        super().__init__()
-
-        self.use_shortcut = use_shortcut
-
-        self.layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(layer_sizes[0], layer_sizes[1]), GELU()),
-            nn.Sequential(nn.Linear(layer_sizes[1], layer_sizes[2]), GELU()),
-            nn.Sequential(nn.Linear(layer_sizes[2], layer_sizes[3]), GELU()),
-            nn.Sequential(nn.Linear(layer_sizes[3], layer_sizes[4]), GELU()),
-            nn.Sequential(nn.Linear(layer_sizes[4], layer_sizes[5]), GELU())
-        ])
-
-    def forward(self, x):
-
-        for layer in self.layers:
-
-            layer_output = layer(x)
-
-            if self.use_shortcut and x.shape == layer_output.shape:
-                x = x + layer_output
-            else:
-                x = layer_output
-
-        return x
-
-
-def print_gradients(model, x):
-
-    output = model(x)
-    target = torch.tensor([[0.]])
-
-    loss = nn.MSELoss()(output, target)
-    loss.backward()
-
-    for name, param in model.named_parameters():
-
-        if 'weight' in name:
-            print(
-                f"{name} has gradient mean of "
-                f"{param.grad.abs().mean().item()}"
-            )
 
 
 class MultiHeadAttention(nn.Module):
@@ -305,114 +262,156 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
 
 
+def download_and_load_gpt2(model_size, models_dir):
+
+    allowed_sizes = ("124M", "355M", "774M", "1558M")
+    if model_size not in allowed_sizes:
+        raise ValueError(f"Model size not in {allowed_sizes}")
+
+    model_dir = os.path.join(models_dir, model_size)
+    base_url = "https://openaipublic.blob.core.windows.net/gpt-2/models"
+    filenames = [
+        "checkpoint", "encoder.json", "hparams.json",
+        "model.ckpt.data-00000-of-00001", "model.ckpt.index",
+        "model.ckpt.meta", "vocab.bpe"
+    ]
+
+    os.makedirs(model_dir, exist_ok=True)
+    for filename in filenames:
+        file_url = f"{base_url}/{model_size}/{filename}"
+        file_path = os.path.join(model_dir, filename)
+        download_file(file_url, file_path)
+
+    tf_ckpt_path = tf.train.latest_checkpoint(model_dir)
+    settings = json.load(open(os.path.join(model_dir, "hparams.json")))
+    params = load_gpt2_params_from_tf_ckpt(tf_ckpt_path, settings)
+
+    return settings, params
+
+
+def download_file(url, destination):
+
+    try:
+        response = requests.get(url, stream=True)
+
+        file_size = int(response.headers.get("content-length", 0))
+
+        if os.path.exists(destination):
+            file_size_local = os.path.getsize(destination)
+            if file_size == file_size_local:
+                print(f"File already exists and is up-to-date: {destination}")
+                return
+
+        block_size = 1024
+
+        progress_bar_description = url.split("/")[-1]
+        with tqdm(total=file_size, unit="iB", unit_scale=True, desc=progress_bar_description) as progress_bar:
+            with open(destination, "wb") as file:
+                for chunk in response.iter_content(block_size):
+                    progress_bar.update(len(chunk))
+                    file.write(chunk)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading the file: {e}")
+        print(f"Please check the URL: {url}")
+
+
+def load_gpt2_params_from_tf_ckpt(ckpt_path, settings):
+
+    params = {"blocks": [{} for _ in range(settings["n_layer"])]}
+
+    for name, _ in tf.train.list_variables(ckpt_path):
+
+        variable_array = np.squeeze(tf.train.load_variable(ckpt_path, name))
+
+        variable_name_parts = name.split("/")[1:]
+
+        target_dict = params
+        if variable_name_parts[0].startswith("h"):
+            layer_number = int(variable_name_parts[0][1:])
+            target_dict = params["blocks"][layer_number]
+
+        for key in variable_name_parts[1:-1]:
+            target_dict = target_dict.setdefault(key, {})
+
+        last_key = variable_name_parts[-1]
+        target_dict[last_key] = variable_array
+
+    return params
+
+
+def assign(left, right):
+
+    if left.shape != right.shape:
+        raise ValueError(f"Shape mismatch. Left: {left.shape}, Right: {right.shape}")
+
+    return torch.nn.Parameter(torch.tensor(right))
+
+
+def load_weights_into_gpt(gpt, params):
+
+    gpt.pos_emb.weight = assign(gpt.pos_emb.weight, params["wpe"])
+    gpt.tok_emb.weight = assign(gpt.tok_emb.weight, params["wte"])
+
+    for b in range(len(params["blocks"])):
+
+        block = params["blocks"][b]
+
+        q_w, k_w, v_w = np.split(block["attn"]["c_attn"]["w"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.weight = assign(gpt.trf_blocks[b].att.W_query.weight, q_w.T)
+        gpt.trf_blocks[b].att.W_key.weight = assign(gpt.trf_blocks[b].att.W_key.weight, k_w.T)
+        gpt.trf_blocks[b].att.W_value.weight = assign(gpt.trf_blocks[b].att.W_value.weight, v_w.T)
+
+        q_b, k_b, v_b = np.split(block["attn"]["c_attn"]["b"], 3, axis=-1)
+        gpt.trf_blocks[b].att.W_query.bias = assign(gpt.trf_blocks[b].att.W_query.bias, q_b)
+        gpt.trf_blocks[b].att.W_key.bias = assign(gpt.trf_blocks[b].att.W_key.bias, k_b)
+        gpt.trf_blocks[b].att.W_value.bias = assign(gpt.trf_blocks[b].att.W_value.bias, v_b)
+
+        gpt.trf_blocks[b].att.out_proj.weight = assign(
+            gpt.trf_blocks[b].att.out_proj.weight, block["attn"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].att.out_proj.bias = assign(
+            gpt.trf_blocks[b].att.out_proj.bias, block["attn"]["c_proj"]["b"])
+
+        gpt.trf_blocks[b].ff.layers[0].weight = assign(
+            gpt.trf_blocks[b].ff.layers[0].weight, block["mlp"]["c_fc"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[0].bias = assign(
+            gpt.trf_blocks[b].ff.layers[0].bias, block["mlp"]["c_fc"]["b"])
+        gpt.trf_blocks[b].ff.layers[2].weight = assign(
+            gpt.trf_blocks[b].ff.layers[2].weight, block["mlp"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[2].bias = assign(
+            gpt.trf_blocks[b].ff.layers[2].bias, block["mlp"]["c_proj"]["b"])
+
+        gpt.trf_blocks[b].norm1.scale = assign(gpt.trf_blocks[b].norm1.scale, block["ln_1"]["g"])
+        gpt.trf_blocks[b].norm1.shift = assign(gpt.trf_blocks[b].norm1.shift, block["ln_1"]["b"])
+        gpt.trf_blocks[b].norm2.scale = assign(gpt.trf_blocks[b].norm2.scale, block["ln_2"]["g"])
+        gpt.trf_blocks[b].norm2.shift = assign(gpt.trf_blocks[b].norm2.shift, block["ln_2"]["b"])
+
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+    gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
+
+
 if __name__ == "__main__":
 
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    batch = []
-
-    txt1 = "Every effort moves you"
-    txt2 = "Every day holds a"
-
-    batch.append(torch.tensor(tokenizer.encode(txt1)))
-    batch.append(torch.tensor(tokenizer.encode(txt2)))
-
-    batch = torch.stack(batch, dim=0)
-
-    print(batch)
-
-    torch.manual_seed(123)
-
-    batch_example = torch.randn(2, 5)
-
-    ln = LayerNorm(emb_dim=5)
-    out_ln = ln(batch_example)
-
-    print("LN mean:\n", out_ln.mean(dim=-1, keepdim=True))
-
-    print(
-        "LN var:\n",
-        out_ln.var(dim=-1, unbiased=False, keepdim=True)
-    )
-
-    ffn = FeedForward(GPT_CONFIG_124M)
-
-    print("FFN out shape:", ffn(torch.rand(2, 3, 768)).shape)
-
-    layer_sizes = [3, 3, 3, 3, 3, 1]
-    sample_input = torch.tensor([[1., 0., -1.]])
-
-    torch.manual_seed(123)
-
-    print_gradients(
-        ExampleDeepNeuralNetwork(layer_sizes, use_shortcut=False),
-        sample_input
-    )
-
-    torch.manual_seed(123)
-
-    print_gradients(
-        ExampleDeepNeuralNetwork(layer_sizes, use_shortcut=True),
-        sample_input
-    )
-
-    torch.manual_seed(123)
-
-    x = torch.rand(2, 4, 768)
-
-    block = TransformerBlock(GPT_CONFIG_124M)
-
-    print("Block output shape:", block(x).shape)
-
-    torch.manual_seed(123)
-
-    model = GPTModel(GPT_CONFIG_124M)
-
-    out = model(batch)
-
-    print("Input batch:\n", batch)
-    print("Output shape:", out.shape)
-
-    total_params = sum(p.numel() for p in model.parameters())
-
-    print(f"Total number of parameters: {total_params:,}")
-
-    print("Token embedding layer shape:", model.tok_emb.weight.shape)
-    print("Output layer shape:", model.out_head.weight.shape)
-
-    total_params_gpt2 = total_params - sum(
-        p.numel() for p in model.out_head.parameters()
-    )
-
-    print(
-        "Number of trainable parameters considering weight tying:",
-        f"{total_params_gpt2:,}"
-    )
-
-    total_size_mb = total_params * 4 / (1024 * 1024)
-
-    print(f"Total size of the model: {total_size_mb:.2f} MB")
-
     start_context = "Hello, I am"
+    encoded_tensor = torch.tensor(tokenizer.encode(start_context)).unsqueeze(0)
 
-    encoded = tokenizer.encode(start_context)
+    settings, params = download_and_load_gpt2(model_size="124M", models_dir="gpt2")
 
-    print("encoded:", encoded)
+    NEW_CONFIG = GPT_CONFIG_124M.copy()
+    NEW_CONFIG.update({"qkv_bias": True})
 
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)
-
-    print("encoded_tensor.shape:", encoded_tensor.shape)
-
-    model.eval()
+    gpt = GPTModel(NEW_CONFIG)
+    load_weights_into_gpt(gpt, params)
+    gpt.eval()
 
     out = generate_text_simple(
-        model=model,
+        model=gpt,
         idx=encoded_tensor,
-        max_new_tokens=6,
-        context_size=GPT_CONFIG_124M["context_length"]
+        max_new_tokens=25,
+        context_size=NEW_CONFIG["context_length"]
     )
-
-    print("Output:", out)
-    print("Output length:", len(out[0]))
 
     print(tokenizer.decode(out.squeeze(0).tolist()))
